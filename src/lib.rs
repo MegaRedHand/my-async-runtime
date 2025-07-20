@@ -23,7 +23,28 @@ impl Runtime {
     }
 }
 
-pub fn spawn<F, T>(f: F) -> impl Future<Output = T>
+pub struct JoinHandle<T> {
+    task: async_task::Task<T>,
+}
+
+impl<T> JoinHandle<T> {
+    pub fn new(task: async_task::Task<T>) -> Self {
+        Self { task }
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = T;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.task).poll(cx)
+    }
+}
+
+pub fn spawn<F, T>(f: F) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -31,7 +52,7 @@ where
     eprintln!("[runtime] Spawning new task...");
     let (runnable, task) = async_task::spawn(f, schedule);
     schedule(runnable);
-    task
+    JoinHandle::new(task)
 }
 
 fn schedule(runnable: Runnable) {
