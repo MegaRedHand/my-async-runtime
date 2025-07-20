@@ -2,9 +2,8 @@ use std::{
     future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
-    task,
 };
 
 use async_task::Runnable;
@@ -25,13 +24,15 @@ impl Runtime {
         let (runnable, task) = async_task::spawn(wrapped_fut, schedule);
         schedule(runnable);
 
-        let executors = vec![Box::new(Executor::new())];
+        let mut executors = vec![];
+        let mut progress = vec![];
 
         std::thread::scope(|s| {
-            let mut progress = vec![0];
             let mut handles = vec![];
 
-            let executor = &executors[0];
+            executors.push(Arc::new(Executor::new()));
+            let executor = executors.last().unwrap().clone();
+            progress.push(0);
             let jh = s.spawn(move || executor.execute_from_queue());
             handles.push(jh);
 
@@ -51,18 +52,21 @@ impl Runtime {
                         // Progress has been made, so we can continue
                         *last_progress = current_progress;
                     } else {
-                        blocked_executors.push(executor);
+                        blocked_executors.push(executor.clone());
                     }
                 }
-                for executor in blocked_executors {
+                for _executor in blocked_executors {
                     eprintln!("[runtime] Executor is blocked, spawning new executor...");
-                    let new_executor = Executor::new();
-                    let jh = s.spawn(move || new_executor.execute_from_queue());
+                    executors.push(Arc::new(Executor::new()));
+                    let executor = executors.last().unwrap().clone();
+                    progress.push(0);
+                    let jh = s.spawn(move || executor.execute_from_queue());
                     handles.push(jh);
                 }
             }
+            eprintln!("[runtime] All tasks completed, shutting down executors...");
             executors.iter().for_each(|executor| {
-                executor.is_finished.store(true, Ordering::Release);
+                executor.is_finished.store(true, Ordering::Relaxed);
             });
         });
     }
@@ -119,7 +123,7 @@ impl Executor {
     }
 
     fn execute_from_queue(&self) {
-        while !self.is_finished.load(Ordering::Acquire) {
+        while !self.is_finished.load(Ordering::Relaxed) {
             eprintln!("[{:?}] Fetching tasks...", std::thread::current().id());
             let opt_runnable = GLOBAL_QUEUE.lock().unwrap().pop();
             if let Some(runnable) = opt_runnable {
