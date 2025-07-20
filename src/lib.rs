@@ -1,4 +1,11 @@
-use std::{future::Future, sync::Mutex};
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex,
+    },
+    task,
+};
 
 use async_task::Runnable;
 
@@ -18,8 +25,46 @@ impl Runtime {
         let (runnable, task) = async_task::spawn(wrapped_fut, schedule);
         schedule(runnable);
 
-        let t = std::thread::spawn(move || execute_from_queue(task));
-        t.join().unwrap();
+        let executors = vec![Box::new(Executor::new())];
+
+        std::thread::scope(|s| {
+            let mut progress = vec![0];
+            let mut handles = vec![];
+
+            let executor = &executors[0];
+            let jh = s.spawn(move || executor.execute_from_queue());
+            handles.push(jh);
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+
+                if task.is_finished() {
+                    break;
+                }
+                if GLOBAL_QUEUE.lock().unwrap().is_empty() {
+                    continue;
+                }
+                let mut blocked_executors = vec![];
+                for (last_progress, executor) in progress.iter_mut().zip(&executors) {
+                    let current_progress = executor.progress.load(Ordering::Acquire);
+                    if current_progress > *last_progress {
+                        // Progress has been made, so we can continue
+                        *last_progress = current_progress;
+                    } else {
+                        blocked_executors.push(executor);
+                    }
+                }
+                for executor in blocked_executors {
+                    eprintln!("[runtime] Executor is blocked, spawning new executor...");
+                    let new_executor = Executor::new();
+                    let jh = s.spawn(move || new_executor.execute_from_queue());
+                    handles.push(jh);
+                }
+            }
+            executors.iter().for_each(|executor| {
+                executor.is_finished.store(true, Ordering::Release);
+            });
+        });
     }
 }
 
@@ -49,29 +94,41 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    eprintln!("[runtime] Spawning new task...");
+    eprintln!("[{:?}] Spawning new task...", std::thread::current().id());
     let (runnable, task) = async_task::spawn(f, schedule);
     schedule(runnable);
     JoinHandle::new(task)
 }
 
 fn schedule(runnable: Runnable) {
-    eprintln!("[runtime] Scheduling task...");
+    eprintln!("[{:?}] Scheduling task...", std::thread::current().id());
     GLOBAL_QUEUE.lock().unwrap().push(runnable);
 }
 
-fn execute_from_queue<T, M>(task: async_task::Task<T, M>) {
-    loop {
-        eprintln!("[runtime] Fetching tasks...");
-        let opt_runnable = GLOBAL_QUEUE.lock().unwrap().pop();
-        if let Some(runnable) = opt_runnable {
-            eprintln!("[runtime] Running task...");
-            runnable.run();
-            if task.is_finished() {
-                break;
+struct Executor {
+    progress: AtomicU64,
+    is_finished: AtomicBool,
+}
+
+impl Executor {
+    fn new() -> Self {
+        Executor {
+            progress: AtomicU64::new(0),
+            is_finished: AtomicBool::new(false),
+        }
+    }
+
+    fn execute_from_queue(&self) {
+        while !self.is_finished.load(Ordering::Acquire) {
+            eprintln!("[{:?}] Fetching tasks...", std::thread::current().id());
+            let opt_runnable = GLOBAL_QUEUE.lock().unwrap().pop();
+            if let Some(runnable) = opt_runnable {
+                eprintln!("[{:?}] Running task...", std::thread::current().id());
+                runnable.run();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            self.progress.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
