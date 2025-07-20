@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-task = "4.7.1"
+
+[dev-dependencies]
+async-channel = "2.5.0"
